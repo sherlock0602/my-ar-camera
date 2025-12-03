@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web AR 終極版 (多人+拍照修正)</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', sans-serif;
+            background-color: #1a1a1a;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            overflow-y: auto;
+        }
+
+        /* 影片顯示區 */
+        .viewport {
+            position: relative;
+            width: 100%;
+            max-width: 640px;
+            aspect-ratio: 4/3;
+            background: #000;
+            margin-top: 10px;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            flex-shrink: 0;
+        }
+
+        #webcam { display: none; }
+        #output_canvas { width: 100%; height: 100%; object-fit: cover; }
+
+        /* 控制面板區 */
+        .controls {
+            width: 100%;
+            max-width: 640px;
+            padding: 20px 10px;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        /* 調整滑桿面板 */
+        .adjust-panel {
+            background: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .slider-row {
+            display: flex;
+            align-items: center;
+            font-size: 14px;
+            gap: 10px;
+        }
+        .slider-row label { width: 40px; text-align: right; font-weight: bold; }
+        .slider-row input { flex-grow: 1; cursor: pointer; height: 6px; }
+        .slider-row span { width: 40px; text-align: left; opacity: 0.8; font-family: monospace; padding-left: 5px;}
+
+        /* 按鈕與排版 */
+        .row { display: flex; gap: 10px; justify-content: space-between; }
+        
+        button, select, label.btn {
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background: #333;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            text-align: center;
+        }
+        
+        button.primary, label.primary { background-color: #007bff; border: none; }
+        button.snap { background-color: #ff9800; border: none; flex-grow: 1; font-weight: bold;}
+        button:hover, label.btn:hover { filter: brightness(1.1); }
+        button:active { transform: translateY(1px); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* 圖片縮圖列 */
+        .asset-bar {
+            display: flex;
+            gap: 10px;
+            overflow-x: auto;
+            padding: 10px;
+            background: #222;
+            border-radius: 8px;
+            scrollbar-width: none; /* Firefox */
+        }
+        .asset-bar::-webkit-scrollbar { display: none; /* Chrome/Safari */ }
+
+        .asset-item {
+            width: 60px;
+            height: 60px;
+            border-radius: 8px;
+            border: 2px solid #444;
+            background: #fff;
+            object-fit: contain;
+            cursor: pointer;
+            flex-shrink: 0;
+            transition: all 0.2s;
+        }
+        .asset-item:hover { transform: scale(1.05); }
+        .asset-item.active { border-color: #007bff; transform: scale(1.1); box-shadow: 0 0 10px rgba(0,123,255,0.3); }
+
+        #fileInput { display: none; }
+        #status { font-size: 12px; color: #aaa; text-align: center; }
+    </style>
+</head>
+<body>
+
+    <div class="viewport">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <div class="controls">
+        
+        <div class="adjust-panel">
+            <div style="font-size:12px; color:#aaa; display:flex; justify-content:space-between;">
+                <span>🛠️ 位置與大小 (同步所有臉部)</span>
+                <button id="resetBtn" style="padding: 2px 8px; font-size: 11px; height:auto;">重置</button>
+            </div>
+            <div class="slider-row">
+                <label>↕️</label>
+                <input type="range" id="offsetY" min="-200" max="100" value="-80">
+                <span id="valY">-80</span>
+            </div>
+            <div class="slider-row">
+                <label>↔️</label>
+                <input type="range" id="offsetX" min="-100" max="100" value="0">
+                <span id="valX">0</span>
+            </div>
+            <div class="slider-row">
+                <label>🔍</label>
+                <input type="range" id="scale" min="10" max="500" value="250">
+                <span id="valScale">2.5</span>
+            </div>
+        </div>
+
+        <div id="status">系統初始化中...</div>
+        
+        <div class="row">
+            <select id="cameraSelect"><option>搜尋相機...</option></select>
+            <button id="snapButton" class="snap" disabled>📸 拍照存檔</button>
+        </div>
+
+        <div class="row">
+            <label for="fileInput" class="btn primary" style="width:100%">📂 匯入圖片 (支援多選)</label>
+            <input type="file" id="fileInput" multiple accept="image/*">
+        </div>
+
+        <div class="asset-bar" id="assetBar">
+            <img src="https://cdn-icons-png.flaticon.com/512/1864/1864514.png" class="asset-item active" crossorigin="anonymous" title="貓">
+        </div>
+    </div>
+
+    <script type="module">
+        import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+        // DOM 元素選取
+        const video = document.getElementById("webcam");
+        const canvas = document.getElementById("output_canvas");
+        const ctx = canvas.getContext("2d");
+        const statusText = document.getElementById("status");
+        const assetBar = document.getElementById("assetBar");
+        
+        const sliderY = document.getElementById("offsetY");
+        const sliderX = document.getElementById("offsetX");
+        const sliderScale = document.getElementById("scale");
+        const valY = document.getElementById("valY");
+        const valX = document.getElementById("valX");
+        const valScale = document.getElementById("valScale");
+        const resetBtn = document.getElementById("resetBtn");
+        const snapButton = document.getElementById("snapButton");
+
+        // 全域變數
+        let faceLandmarker;
+        let lastVideoTime = -1;
+        let activeImage = assetBar.children[0];
+        let imageSettingsMap = new Map(); // 記憶每張圖的設定
+
+        // --- 1. 設定值管理邏輯 ---
+        function updateSettingsDisplay() {
+            valY.innerText = sliderY.value;
+            valX.innerText = sliderX.value;
+            valScale.innerText = (sliderScale.value / 100).toFixed(1);
+        }
+
+        function saveCurrentSettings() {
+            if(!activeImage) return;
+            imageSettingsMap.set(activeImage.src, {
+                y: parseInt(sliderY.value),
+                x: parseInt(sliderX.value),
+                s: parseInt(sliderScale.value)
+            });
+        }
+
+        function loadSettingsForImage(img) {
+            const saved = imageSettingsMap.get(img.src);
+            if (saved) {
+                sliderY.value = saved.y;
+                sliderX.value = saved.x;
+                sliderScale.value = saved.s;
+            } else {
+                // 預設值
+                sliderY.value = -80;
+                sliderX.value = 0;
+                sliderScale.value = 250;
+            }
+            updateSettingsDisplay();
+        }
+
+        // 監聽滑桿
+        [sliderY, sliderX, sliderScale].forEach(el => {
+            el.addEventListener("input", () => {
+                updateSettingsDisplay();
+                saveCurrentSettings();
+            });
+        });
+
+        // 重置按鈕
+        resetBtn.addEventListener("click", () => {
+            sliderY.value = -80;
+            sliderX.value = 0;
+            sliderScale.value = 250;
+            updateSettingsDisplay();
+            saveCurrentSettings();
+        });
+
+        // --- 2. 初始化 AI 模型 ---
+        async function init() {
+            try {
+                const filesetResolver = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+                );
+                faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+                    baseOptions: {
+                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO",
+                    numFaces: 5 // 設定最多偵測 5 張臉
+                });
+                statusText.innerText = "模型就緒，請開啟相機";
+                setupCamera();
+            } catch (e) {
+                statusText.innerText = "模型載入失敗: " + e;
+            }
+        }
+        init();
+
+        // --- 3. 相機設定 ---
+        async function setupCamera() {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const videoDevices = devices.filter(d => d.kind === 'videoinput');
+            const select = document.getElementById("cameraSelect");
+            select.innerHTML = "";
+            
+            videoDevices.forEach(device => {
+                const opt = document.createElement("option");
+                opt.value = device.deviceId;
+                opt.text = device.label || "相機 " + (select.length + 1);
+                select.appendChild(opt);
+            });
+
+            // 啟動第一個相機
+            startCamera(videoDevices[0]?.deviceId);
+            
+            // 監聽切換
+            select.addEventListener("change", (e) => startCamera(e.target.value));
+        }
+
+        async function startCamera(deviceId) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        deviceId: deviceId ? { exact: deviceId } : undefined, 
+                        width: { ideal: 1280 }, 
+                        height: { ideal: 720 } 
+                    }
+                });
+                video.srcObject = stream;
+                video.addEventListener("loadeddata", predictWebcam);
+                snapButton.disabled = false;
+                statusText.innerText = "運作中 - 支援多人臉部偵測";
+            } catch(e) {
+                statusText.innerText = "相機錯誤: " + e.message;
+            }
+        }
+
+        // --- 4. 核心偵測迴圈 ---
+        async function predictWebcam() {
+            // 確保 Canvas 尺寸正確
+            if(canvas.width !== video.videoWidth || canvas.height !== video.videoHeight){
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+            }
+
+            if (lastVideoTime !== video.currentTime) {
+                lastVideoTime = video.currentTime;
+                const results = faceLandmarker.detectForVideo(video, performance.now());
+
+                // 清除畫面
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                
+                // 鏡像翻轉與繪製原始影片
+                ctx.save();
+                ctx.translate(canvas.width, 0);
+                ctx.scale(-1, 1);
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                // 遍歷所有偵測到的臉
+                if (results.faceLandmarks && results.faceLandmarks.length > 0 && activeImage) {
+                    for (const landmarks of results.faceLandmarks) {
+                        drawOverlay(landmarks);
+                    }
+                }
+                ctx.restore();
+            }
+            window.requestAnimationFrame(predictWebcam);
+        }
+
+        // --- 5. 繪圖邏輯 ---
+        function drawOverlay(landmarks) {
+            const w = canvas.width;
+            const h = canvas.height;
+            
+            // 關鍵點
+            const top = landmarks[10]; 
+            const left = landmarks[234];
+            const right = landmarks[454];
+
+            // 計算幾何
+            const faceW = Math.hypot((right.x - left.x) * w, (right.y - left.y) * h);
+            const angle = Math.atan2((right.y - left.y) * h, (right.x - left.x) * w);
+
+            // 讀取滑桿數值
+            const scaleVal = sliderScale.value / 100;
+            const offYVal = sliderY.value / 100;
+            const offXVal = sliderX.value / 100;
+
+            const imgAspect = activeImage.naturalWidth / activeImage.naturalHeight;
+            const drawWidth = faceW * scaleVal;
+            const drawHeight = drawWidth / imgAspect;
+
+            ctx.save();
+            ctx.translate(top.x * w, top.y * h);
+            ctx.rotate(angle);
+            
+            // 計算偏移
+            const moveX = faceW * offXVal;
+            const moveY = faceW * offYVal;
+
+            ctx.drawImage(
+                activeImage, 
+                (-drawWidth / 2) + moveX, 
+                moveY, 
+                drawWidth, 
+                drawHeight
+            );
+            
+            ctx.restore();
+        }
+
+        // --- 6. 圖片與列表邏輯 ---
+        function setActive(img) {
+            document.querySelectorAll('.asset-item').forEach(e => e.classList.remove('active'));
+            img.classList.add('active');
+            activeImage = img;
+            loadSettingsForImage(img);
+        }
+        
+        // 綁定預設圖片
+        activeImage.onclick = () => setActive(activeImage);
+
+        // 綁定上傳
+        document.getElementById("fileInput").addEventListener("change", (e) => {
+            for (let file of e.target.files) {
+                const img = document.createElement("img");
+                img.src = URL.createObjectURL(file);
+                img.className = "asset-item";
+                img.onload = () => { img.onclick = () => setActive(img); };
+                assetBar.appendChild(img);
+                // 如果是第二張(第一張上傳的)，自動選中
+                if(assetBar.children.length === 2) setActive(img);
+            }
+        });
+
+        // --- 7. 拍照存檔 (增強版) ---
+        snapButton.addEventListener("click", () => {
+            // 視覺回饋：閃光燈
+            ctx.save();
+            ctx.fillStyle = "rgba(255, 255, 255, 0.8)";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.restore();
+
+            setTimeout(() => {
+                try {
+                    const dataURL = canvas.toDataURL("image/png");
+                    const link = document.createElement('a');
+                    const time = new Date().toISOString().replace(/[:.]/g, "-");
+                    link.download = `AR-Photo-${time}.png`;
+                    link.href = dataURL;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                } catch (e) {
+                    console.error(e);
+                    alert("⚠️ 存檔失敗！\n\n原因：瀏覽器安全性限制 (CORS)。\n請改用 'Live Server' 開啟此網頁，不要直接點擊 index.html 開啟。");
+                }
+            }, 100);
+        });
+
+    </script>
+</body>
+</html>
